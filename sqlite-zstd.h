@@ -1,0 +1,38 @@
+/*
+** sqlite-zstd.h — zstd compression functions for SQLite.
+**
+** BSD 3-Clause License. See LICENSE for details.
+*/
+#ifndef SQLITE_ZSTD_H
+#define SQLITE_ZSTD_H
+
+#ifndef SQLITE_CORE
+#include "sqlite3ext.h"
+#else
+#include "sqlite3.h"
+#endif
+
+#ifdef SQLITE_ZSTD_STATIC
+  #define SQLITE_ZSTD_API
+#else
+  #ifdef _WIN32
+    #define SQLITE_ZSTD_API __declspec(dllexport)
+  #else
+    #define SQLITE_ZSTD_API
+  #endif
+#endif
+
+#define SQLITE_ZSTD_VERSION "v1.0.0"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+SQLITE_ZSTD_API int sqlite3_zstd_init(sqlite3 *db, char **pzErrMsg,
+                                       const sqlite3_api_routines *pApi);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ifndef SQLITE_ZSTD_H */
