@@ -1,5 +1,5 @@
 /*
-** sqlite_zstd.c: zstd compression functions for SQLite.
+** zstd0.c: zstd compression functions for SQLite.
 **
 ** Standard compression:
 **   zstd_compress(data)              compress at default level (3)
@@ -22,7 +22,7 @@
 ** BSD 3-Clause License. See LICENSE for details.
 */
 
-#include "sqlite_zstd.h"
+#include "zstd0.h"
 
 #include <stdarg.h>
 #include <stdlib.h>

@@ -12,18 +12,18 @@ endif
 
 SEEKABLE_SRC = seekable/zstdseek_compress.c seekable/zstdseek_decompress.c
 
-$(TARGET): sqlite_zstd.c sqlite_zstd.h $(SEEKABLE_SRC)
-	$(CC) -fPIC -shared $(CFLAGS) -I. sqlite_zstd.c $(SEEKABLE_SRC) -o $@ $(LDFLAGS)
+$(TARGET): zstd0.c zstd0.h $(SEEKABLE_SRC)
+	$(CC) -fPIC -shared $(CFLAGS) -I. zstd0.c $(SEEKABLE_SRC) -o $@ $(LDFLAGS)
 
-static: sqlite_zstd.c sqlite_zstd.h $(SEEKABLE_SRC)
-	$(CC) -c -O2 -DSQLITE_CORE -DSQLITE_ZSTD_STATIC $(CFLAGS) -I. sqlite_zstd.c -o sqlite_zstd.o
+static: zstd0.c zstd0.h $(SEEKABLE_SRC)
+	$(CC) -c -O2 -DSQLITE_CORE -DSQLITE_ZSTD_STATIC $(CFLAGS) -I. zstd0.c -o zstd0.o
 	$(CC) -c -O2 $(CFLAGS) -I. seekable/zstdseek_compress.c -o zstdseek_compress.o
 	$(CC) -c -O2 $(CFLAGS) -I. seekable/zstdseek_decompress.c -o zstdseek_decompress.o
 
 install: $(TARGET)
 	install -d $(INSTALL_LIB_DIR)
 	install -m 644 $(TARGET) $(INSTALL_LIB_DIR)
-	install -m 644 sqlite_zstd.h $(INSTALL_LIB_DIR)/../include/ 2>/dev/null || true
+	install -m 644 zstd0.h $(INSTALL_LIB_DIR)/../include/ 2>/dev/null || true
 
 test: $(TARGET)
 	@echo "=== zstd_compress / zstd_uncompress ==="
