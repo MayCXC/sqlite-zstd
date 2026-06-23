@@ -1,5 +1,5 @@
 /*
-** sqlite-zstd.h — zstd compression functions for SQLite.
+** sqlite_zstd.h — zstd compression functions for SQLite.
 **
 ** BSD 3-Clause License. See LICENSE for details.
 */
