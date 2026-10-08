@@ -38,6 +38,16 @@ test: $(TARGET)
 	  "SELECT length(zstd_uncompress(zstd_seekable_compress(zeroblob(100000), 16384)));" \
 	  "SELECT length(zstd_seekable_decompress(zstd_seekable_compress(zeroblob(100000), 16384), 0, 500));" \
 	  "SELECT zstd_content_size(zstd_seekable_compress(zeroblob(100000), 16384));"
+	@echo "=== zstd_seekable_decompress at and past the end (each check fails the target) ==="
+	sqlite3 -bail :memory: ".load ./zstd0" \
+	  "CREATE TABLE s AS SELECT zstd_seekable_compress(zeroblob(100000), 16384) AS d;" \
+	  "SELECT 'offset at the end: ' || (SELECT CASE WHEN typeof(v) = 'blob' AND length(v) = 0 THEN 'ok' ELSE abs(-9223372036854775808) END FROM (SELECT zstd_seekable_decompress(d, 100000, 10) AS v FROM s));" \
+	  "SELECT 'offset just past the end: ' || (SELECT CASE WHEN typeof(v) = 'blob' AND length(v) = 0 THEN 'ok' ELSE abs(-9223372036854775808) END FROM (SELECT zstd_seekable_decompress(d, 100001, 1) AS v FROM s));" \
+	  "SELECT 'offset far past the end: ' || (SELECT CASE WHEN typeof(v) = 'blob' AND length(v) = 0 THEN 'ok' ELSE abs(-9223372036854775808) END FROM (SELECT zstd_seekable_decompress(d, 200000, 10) AS v FROM s));" \
+	  "SELECT 'range over the end: ' || (SELECT CASE WHEN length(v) = 5 THEN 'ok' ELSE abs(-9223372036854775808) END FROM (SELECT zstd_seekable_decompress(d, 99995, 10) AS v FROM s));" \
+	  "SELECT 'raw, offset past the end: ' || CASE WHEN length(zstd_seekable_decompress(X'0102030405', 10, 2)) = 0 THEN 'ok' ELSE abs(-9223372036854775808) END;" \
+	  "SELECT 'raw, offset past 2^31: ' || CASE WHEN length(zstd_seekable_decompress(X'0102030405', 3000000000, 2)) = 0 THEN 'ok' ELSE abs(-9223372036854775808) END;" \
+	  "SELECT 'raw, range over the end: ' || CASE WHEN zstd_seekable_decompress(X'0102030405', 3, 10) = X'0405' THEN 'ok' ELSE abs(-9223372036854775808) END;"
 	@echo "=== sqlar compat (uncompressed passthrough) ==="
 	sqlite3 :memory: ".load ./zstd0" \
 	  "SELECT length(zstd_compress(X'AABB'));" \

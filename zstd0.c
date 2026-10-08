@@ -247,6 +247,38 @@ static void fn_seekable_compress(sqlite3_context *ctx, int argc,
 
 /* ---- zstd_seekable_decompress(data, offset, len) --------------------- */
 
+/* Decompress len bytes at offset from an initialized seekable stream into the
+** function's result. ZSTD_seekable_decompress clamps a range that runs past
+** the end of the data but not one that starts at or past it, whose length
+** would wrap, so that range is empty here. */
+static void result_seekable_range(sqlite3_context *ctx, ZSTD_seekable *zs,
+                                  unsigned long long offset, int len) {
+  unsigned nFrames = ZSTD_seekable_getNumFrames(zs);
+  unsigned long long end = nFrames == 0 ? 0
+      : ZSTD_seekable_getFrameDecompressedOffset(zs, nFrames - 1)
+        + ZSTD_seekable_getFrameDecompressedSize(zs, nFrames - 1);
+  if (offset >= end) {
+    sqlite3_result_zeroblob(ctx, 0);
+    return;
+  }
+  if ((unsigned long long)len > end - offset) len = (int)(end - offset);
+
+  void *dst = sqlite3_malloc(len);
+  if (!dst) {
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+
+  size_t ret = ZSTD_seekable_decompress(zs, dst, len, offset);
+  if (ZSTD_isError(ret)) {
+    sqlite3_free(dst);
+    sqlite3_result_error(ctx, ZSTD_getErrorName(ret), -1);
+    return;
+  }
+
+  sqlite3_result_blob(ctx, dst, (int)ret, sqlite3_free);
+}
+
 static void fn_seekable_decompress(sqlite3_context *ctx, int argc,
                                    sqlite3_value **argv) {
   (void)argc;
@@ -265,8 +297,8 @@ static void fn_seekable_decompress(sqlite3_context *ctx, int argc,
   if (srcLen >= 4) memcpy(&magic2, src, 4);
   if (magic2 != ZSTD_MAGICNUMBER
       && (magic2 & 0xFFFFFFF0) != ZSTD_MAGIC_SKIPPABLE_START) {
+    if (offset >= (unsigned long long)srcLen) { sqlite3_result_zeroblob(ctx, 0); return; }
     int avail = srcLen - (int)offset;
-    if (avail <= 0) { sqlite3_result_zeroblob(ctx, 0); return; }
     if (len > avail) len = avail;
     sqlite3_result_blob(ctx, (const char *)src + offset, len, SQLITE_TRANSIENT);
     return;
@@ -282,23 +314,8 @@ static void fn_seekable_decompress(sqlite3_context *ctx, int argc,
     return;
   }
 
-  void *dst = sqlite3_malloc(len);
-  if (!dst) {
-    ZSTD_seekable_free(zs);
-    sqlite3_result_error_nomem(ctx);
-    return;
-  }
-
-  ret = ZSTD_seekable_decompress(zs, dst, len, offset);
+  result_seekable_range(ctx, zs, offset, len);
   ZSTD_seekable_free(zs);
-
-  if (ZSTD_isError(ret)) {
-    sqlite3_free(dst);
-    sqlite3_result_error(ctx, ZSTD_getErrorName(ret), -1);
-    return;
-  }
-
-  sqlite3_result_blob(ctx, dst, (int)ret, sqlite3_free);
 }
 
 /* ---- zstd_content_size(data) ----------------------------------------- */

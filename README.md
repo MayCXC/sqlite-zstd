@@ -57,6 +57,9 @@ The seekable format writes independent zstd frames with a seek table appended.
 decompresses only that frame. For a 165 MB transcript, range extraction takes
 ~0.5 ms vs ~100 ms for full decompression.
 
+A range that starts at or past the end of the data is an empty blob; one that runs past the
+end stops there.
+
 Range decompression pairs well with a byte-offset index like
 [`sqlite-fts5x`](https://github.com/MayCXC/sqlite-fts5x) to pull a snippet out of a compressed
 archive without decompressing the whole thing.
