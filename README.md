@@ -25,7 +25,7 @@ is backward-compatible concatenated zstd frames.
 
 ## Build
 
-Requires `libzstd` and `libxxhash`.
+Requires `libzstd`, `libxxhash` and SQLite's headers (`sqlite3ext.h`).
 
 ```sh
 make
