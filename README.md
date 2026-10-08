@@ -16,6 +16,8 @@ efficient range decompression.
 - `zstd_seekable_compress(data, frame_size)` custom frame size
 - `zstd_seekable_compress(data, frame_size, level)` custom frame size + level
 - `zstd_seekable_decompress(data, offset, len)` range decompression
+- `zstd_seekable_decompress(table, column, rowid, offset, len)` the same range, read from the
+  row in place (see [Reading a row in place](#reading-a-row-in-place))
 
 **Utilities:**
 - `zstd_content_size(data)` decompressed size from frame header
@@ -48,6 +50,9 @@ INSERT INTO archive (name, data, sz)
 
 -- Range decompress: read 500 bytes starting at offset 10000
 SELECT zstd_seekable_decompress(data, 10000, 500) FROM archive WHERE name = 'log.txt';
+
+-- The same range, the row read in place rather than passed as a value
+SELECT zstd_seekable_decompress('archive', 'data', rowid, 10000, 500) FROM archive WHERE name = 'log.txt';
 ```
 
 ## Seekable format
@@ -59,6 +64,30 @@ decompresses only that frame. For a 165 MB transcript, range extraction takes
 
 A range that starts at or past the end of the data is an empty blob; one that runs past the
 end stops there.
+
+### Reading a row in place
+
+A column passed to a function arrives as a value, and SQLite reads the whole value before the
+call, so `zstd_seekable_decompress(data, offset, len)` decompresses only the frames the range
+covers but reads the entire row to do it. The five-argument form names the row instead (`table`
+and `column` in the `main` schema, and its `rowid`) and opens it with SQLite's
+[incremental blob API](https://www.sqlite.org/c3ref/blob_open.html), handing it to the seekable
+decoder as a reader (`ZSTD_seekable_initAdvanced`, the interface `ZSTD_seekable_initBuff` wraps),
+so a read pulls the seek table at the end of the row and only the compressed bytes of the frames
+it needs. Within a statement the open handle and the row's parsed seek table are kept from call
+to call as [auxiliary data](https://www.sqlite.org/c3ref/get_auxdata.html) on the table argument
+(SQLite keeps it while that argument is a constant, as a table name is) and moved from row to
+row with `sqlite3_blob_reopen`; they are freed when the statement finishes, so the handle's read
+transaction ends with the query.
+
+SQLite stores a value larger than a page as a
+[chain of overflow pages](https://www.sqlite.org/fileformat2.html#ovflpgs), and the first read at
+an offset goes through the pages of the chain before it, so reaching the seek table at the end
+of a row walks the whole row. In an auto-vacuum database whose pages sit in order, SQLite finds
+each next page in the pointer map instead (`getOverflowPage` in `btree.c`): on a 37 MB row,
+reaching the seek table read 36 MB, and 0.06 MB once the same row was written in order into a
+fresh auto-vacuum database. A table that keeps each row to one frame or a few keeps the walk to
+the size of a frame.
 
 Range decompression pairs well with a byte-offset index like
 [`sqlite-fts5x`](https://github.com/MayCXC/sqlite-fts5x) to pull a snippet out of a compressed
