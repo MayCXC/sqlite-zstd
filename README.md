@@ -18,6 +18,8 @@ efficient range decompression.
 - `zstd_seekable_decompress(data, offset, len)` range decompression
 - `zstd_seekable_decompress(table, column, rowid, offset, len)` the same range, read from the
   row in place (see [Reading a row in place](#reading-a-row-in-place))
+- `zstd_frame_decompress(table, column, rowid, offset, len)` a range of a row that holds one
+  frame, read in place from its first byte and only as far as the range ends
 
 **Utilities:**
 - `zstd_content_size(data)` decompressed size from frame header
@@ -88,6 +90,17 @@ each next page in the pointer map instead (`getOverflowPage` in `btree.c`): on a
 reaching the seek table read 36 MB, and 0.06 MB once the same row was written in order into a
 fresh auto-vacuum database. A table that keeps each row to one frame or a few keeps the walk to
 the size of a frame.
+
+A row that holds one frame needs no seek table at all. A frame decodes only from its start, so
+the compressed bytes before the end of the range are all a read of it uses, and
+`zstd_frame_decompress(table, column, rowid, offset, len)` reads exactly those: it opens the row
+the same way, feeds it from its first byte to zstd's
+[streaming decoder](https://facebook.github.io/zstd/zstd_manual.html), and stops once the range
+is complete, so the seek table after the frame and the frame's tail are never read. A seekable
+blob of one frame is such a row, as is a plain zstd frame. A range past the frame's end returns
+what the frame holds of it, and a row cut off inside its frame is an error. Over 30 ranges read
+from an archive of one 4 MiB frame per row (837 KB compressed on average), it read 434 KB per
+range, where the value form read 848 KB and the seekable row form 902 KB.
 
 Range decompression pairs well with a byte-offset index like
 [`sqlite-fts5x`](https://github.com/MayCXC/sqlite-fts5x) to pull a snippet out of a compressed

@@ -321,35 +321,51 @@ static void fn_seekable_decompress(sqlite3_context *ctx, int argc,
 }
 
 /* ---- zstd_seekable_decompress(table, column, rowid, offset, len) ----- */
+/* ---- zstd_frame_decompress(table, column, rowid, offset, len) -------- */
 
 /*
 ** The same range read with the row read in place. A column passed as an
-** argument arrives as a value, which SQLite reads whole before the call; this
-** form opens the row with SQLite's incremental blob API instead and hands it to
-** the seekable decoder as a reader through ZSTD_seekable_initAdvanced, the
-** interface ZSTD_seekable_initBuff and ZSTD_seekable_initFile wrap, so a read
-** pulls the seek table and only the compressed bytes of the frames it needs.
-** The callbacks are ZSTD_seekable_read_buff and ZSTD_seekable_seek_buff
-** (seekable/zstdseek_decompress.c) over sqlite3_blob_read. The open handle and
-** the row's parsed seek table are kept as auxiliary data on the table argument,
-** which SQLite holds from call to call while that argument is a constant, and
-** moved to the next row with sqlite3_blob_reopen. SQLite frees them when the
-** statement halts (closeAllCursors in sqlite3VdbeHalt, at the end of the query
-** or on a reset or finalize), so no read transaction outlives the query. A row
-** stored raw is read in place directly.
+** argument arrives as a value, which SQLite reads whole before the call; these
+** forms open the row with SQLite's incremental blob API instead.
+**
+** zstd_seekable_decompress hands the row to the seekable decoder as a reader
+** through ZSTD_seekable_initAdvanced, the interface ZSTD_seekable_initBuff and
+** ZSTD_seekable_initFile wrap, so a read pulls the seek table and only the
+** compressed bytes of the frames it needs. The callbacks are
+** ZSTD_seekable_read_buff and ZSTD_seekable_seek_buff
+** (seekable/zstdseek_decompress.c) over sqlite3_blob_read. The seek table sits
+** after the last frame, so reaching it reads to the row's end.
+**
+** zstd_frame_decompress reads a row that holds one zstd frame, as a seekable
+** blob of one frame does, from its first byte with zstd's streaming decoder and
+** stops once the range is complete: a frame decodes only from its start, so the
+** compressed bytes up to the range's end are all a read of such a row needs,
+** and the seek table after the frame is never read. A range past the first
+** frame's end returns what the frame holds of it.
+**
+** The open handle, and for the seekable form the row's parsed seek table, are
+** kept as auxiliary data on the table argument, which SQLite holds from call to
+** call while that argument is a constant, and moved to the next row with
+** sqlite3_blob_reopen. SQLite frees them when the statement halts
+** (closeAllCursors in sqlite3VdbeHalt, at the end of the query or on a reset or
+** finalize), so no read transaction outlives the query. A row stored raw is
+** read in place directly.
 ** https://www.sqlite.org/c3ref/blob_open.html
 ** https://www.sqlite.org/c3ref/get_auxdata.html
+** https://facebook.github.io/zstd/zstd_manual.html (streaming decompression)
 */
 
 typedef struct RowSource {
   char *table;
   char *column;
   sqlite3_blob *blob;
-  int loaded;           /* blob, size and zs describe rowid */
+  int loaded;           /* blob, size, zstd and, for a seekable read, zs describe rowid */
   sqlite3_int64 rowid;
   long long size;
   long long pos;
-  ZSTD_seekable *zs;    /* the row's seek table; NULL for a raw row */
+  int zstd;             /* the row starts with a zstd frame; 0 for a raw row */
+  ZSTD_seekable *zs;    /* the row's seek table, for the seekable form */
+  ZSTD_DCtx *dctx;      /* the frame form's decoder, reset for each read */
 } RowSource;
 
 static int rowsource_read(void *opaque, void *buffer, size_t n) {
@@ -379,17 +395,17 @@ static void rowsource_free(void *p) {
   RowSource *rs = (RowSource *)p;
   if (rs->blob) sqlite3_blob_close(rs->blob);
   ZSTD_seekable_free(rs->zs);
+  ZSTD_freeDCtx(rs->dctx);
   sqlite3_free(rs->table);
   sqlite3_free(rs->column);
   sqlite3_free(rs);
 }
 
-/* Point rs at rowid: move the open handle there or open one, then load the
-** row's seek table into a fresh ZSTD_seekable, since loading a table into one
-** that holds a table leaks the old one. On failure the function's error is set,
-** the handle closed, and SQLITE_ERROR returned. */
-static int rowsource_load(sqlite3_context *ctx, RowSource *rs,
-                          sqlite3_int64 rowid) {
+/* Point rs at rowid: move the open handle there or open one, and read the
+** row's size and whether it starts with a zstd frame. On failure the function's
+** error is set, the handle closed, and SQLITE_ERROR returned. */
+static int rowsource_point(sqlite3_context *ctx, RowSource *rs,
+                           sqlite3_int64 rowid) {
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   rs->loaded = 0;
   ZSTD_seekable_free(rs->zs);
@@ -418,30 +434,144 @@ static int rowsource_load(sqlite3_context *ctx, RowSource *rs,
     rs->blob = NULL;
     return SQLITE_ERROR;
   }
-  if (magic == ZSTD_MAGICNUMBER
-      || (magic & 0xFFFFFFF0) == ZSTD_MAGIC_SKIPPABLE_START) {
-    rs->zs = ZSTD_seekable_create();
-    if (!rs->zs) {
-      sqlite3_result_error_nomem(ctx);
-      return SQLITE_ERROR;
-    }
-    ZSTD_seekable_customFile src = { rs, rowsource_read, rowsource_seek };
-    size_t ret = ZSTD_seekable_initAdvanced(rs->zs, src);
-    if (ZSTD_isError(ret)) {
-      sqlite3_result_error(ctx, ZSTD_getErrorName(ret), -1);
-      ZSTD_seekable_free(rs->zs);
-      rs->zs = NULL;
-      return SQLITE_ERROR;
-    }
-  }
+  rs->zstd = magic == ZSTD_MAGICNUMBER
+      || (magic & 0xFFFFFFF0) == ZSTD_MAGIC_SKIPPABLE_START;
   rs->rowid = rowid;
   rs->loaded = 1;
   return SQLITE_OK;
 }
 
-static void fn_seekable_decompress_row(sqlite3_context *ctx, int argc,
-                                       sqlite3_value **argv) {
-  (void)argc;
+/* Point rs at rowid and load a zstd row's seek table into a fresh
+** ZSTD_seekable, since loading a table into one that holds a table leaks the
+** old one. A failure is reported as rowsource_point reports one. */
+static int rowsource_load(sqlite3_context *ctx, RowSource *rs,
+                          sqlite3_int64 rowid) {
+  if (rowsource_point(ctx, rs, rowid) != SQLITE_OK) return SQLITE_ERROR;
+  if (!rs->zstd) return SQLITE_OK;
+  rs->loaded = 0;
+  rs->zs = ZSTD_seekable_create();
+  if (!rs->zs) {
+    sqlite3_result_error_nomem(ctx);
+    return SQLITE_ERROR;
+  }
+  ZSTD_seekable_customFile src = { rs, rowsource_read, rowsource_seek };
+  size_t ret = ZSTD_seekable_initAdvanced(rs->zs, src);
+  if (ZSTD_isError(ret)) {
+    sqlite3_result_error(ctx, ZSTD_getErrorName(ret), -1);
+    ZSTD_seekable_free(rs->zs);
+    rs->zs = NULL;
+    return SQLITE_ERROR;
+  }
+  rs->loaded = 1;
+  return SQLITE_OK;
+}
+
+/* A range of a row stored raw, read in place. */
+static void result_raw_range(sqlite3_context *ctx, RowSource *rs,
+                             unsigned long long offset, int len) {
+  if (offset >= (unsigned long long)rs->size) {
+    sqlite3_result_zeroblob(ctx, 0);
+    return;
+  }
+  long long avail = rs->size - (long long)offset;
+  if (len > avail) len = (int)avail;
+  void *dst = sqlite3_malloc(len);
+  if (!dst) {
+    sqlite3_result_error_nomem(ctx);
+  } else if (sqlite3_blob_read(rs->blob, dst, len, (int)offset) != SQLITE_OK) {
+    sqlite3_free(dst);
+    sqlite3_result_error(ctx,
+        sqlite3_errmsg(sqlite3_context_db_handle(ctx)), -1);
+  } else {
+    sqlite3_result_blob(ctx, dst, len, sqlite3_free);
+  }
+}
+
+/* A range of a zstd row's first frame, decoded from the row's first byte with
+** zstd's streaming decoder. Output before the range goes to a scratch buffer
+** and is dropped, so a read's memory does not grow with its offset, and the
+** read stops once the range is complete or the frame ends. Once the row's
+** bytes are all fed, the decoder is asked to flush what it holds, and a frame
+** it cannot finish from them is an error. */
+static void result_frame_range(sqlite3_context *ctx, RowSource *rs,
+                               unsigned long long offset, int len) {
+  if (!rs->dctx && !(rs->dctx = ZSTD_createDCtx())) {
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+  ZSTD_DCtx_reset(rs->dctx, ZSTD_reset_session_only);
+  int inCap = (int)ZSTD_DStreamInSize();
+  int scratchCap = (int)ZSTD_DStreamOutSize();
+  char *in = sqlite3_malloc(inCap);
+  char *scratch = sqlite3_malloc(scratchCap);
+  char *dst = sqlite3_malloc(len);
+  if (!in || !scratch || !dst) {
+    sqlite3_free(in);
+    sqlite3_free(scratch);
+    sqlite3_free(dst);
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+
+  ZSTD_inBuffer ib = { in, 0, 0 };
+  long long fed = 0;
+  int ended = 0;
+  unsigned long long produced = 0;
+  int got = 0;
+  const char *err = 0;
+  while (got < len) {
+    if (ib.pos == ib.size && !ended) {
+      if (fed >= rs->size) {
+        ended = 1;
+      } else {
+        long long n = rs->size - fed;
+        if (n > inCap) n = inCap;
+        if (sqlite3_blob_read(rs->blob, in, (int)n, (int)fed) != SQLITE_OK) {
+          err = sqlite3_errmsg(sqlite3_context_db_handle(ctx));
+          break;
+        }
+        fed += n;
+        ib.size = (size_t)n;
+        ib.pos = 0;
+      }
+    }
+    ZSTD_outBuffer ob;
+    if (produced < offset) {
+      ob.dst = scratch;
+      ob.size = offset - produced < (unsigned long long)scratchCap
+          ? (size_t)(offset - produced) : (size_t)scratchCap;
+    } else {
+      ob.dst = dst + got;
+      ob.size = (size_t)(len - got);
+    }
+    ob.pos = 0;
+    size_t ret = ZSTD_decompressStream(rs->dctx, &ob, &ib);
+    if (ZSTD_isError(ret)) {
+      err = ZSTD_getErrorName(ret);
+      break;
+    }
+    if (produced >= offset) got += (int)ob.pos;
+    produced += ob.pos;
+    if (ret == 0) break;
+    if (ended && ob.pos == 0) {
+      err = "zstd_frame_decompress: the row ends inside its first frame";
+      break;
+    }
+  }
+  sqlite3_free(in);
+  sqlite3_free(scratch);
+  if (err) {
+    sqlite3_free(dst);
+    sqlite3_result_error(ctx, err, -1);
+    return;
+  }
+  sqlite3_result_blob(ctx, dst, got, sqlite3_free);
+}
+
+/* The row forms' shared body: the statement's source for the call's table and
+** column, pointed at rowid as the form reads it, and the range read from it. */
+static void row_range(sqlite3_context *ctx, sqlite3_value **argv,
+                      int seekable) {
   const char *table = (const char *)sqlite3_value_text(argv[0]);
   const char *column = (const char *)sqlite3_value_text(argv[1]);
   sqlite3_int64 rowid = sqlite3_value_int64(argv[2]);
@@ -449,8 +579,9 @@ static void fn_seekable_decompress_row(sqlite3_context *ctx, int argc,
   int len = sqlite3_value_int(argv[4]);
 
   if (!table || !column) {
-    sqlite3_result_error(ctx,
-        "zstd_seekable_decompress: table and column must be names", -1);
+    sqlite3_result_error(ctx, seekable
+        ? "zstd_seekable_decompress: table and column must be names"
+        : "zstd_frame_decompress: table and column must be names", -1);
     return;
   }
   if (len <= 0) {
@@ -477,7 +608,8 @@ static void fn_seekable_decompress_row(sqlite3_context *ctx, int argc,
   }
 
   if (!rs->loaded || rs->rowid != rowid) {
-    if (rowsource_load(ctx, rs, rowid) != SQLITE_OK) {
+    if ((seekable ? rowsource_load : rowsource_point)(ctx, rs, rowid)
+        != SQLITE_OK) {
       if (fresh) rowsource_free(rs);
       return;
     }
@@ -485,28 +617,27 @@ static void fn_seekable_decompress_row(sqlite3_context *ctx, int argc,
 
   if (rs->size == 0) {
     sqlite3_result_zeroblob(ctx, 0);
-  } else if (!rs->zs) {
-    if (offset >= (unsigned long long)rs->size) {
-      sqlite3_result_zeroblob(ctx, 0);
-    } else {
-      long long avail = rs->size - (long long)offset;
-      if (len > avail) len = (int)avail;
-      void *dst = sqlite3_malloc(len);
-      if (!dst) {
-        sqlite3_result_error_nomem(ctx);
-      } else if (sqlite3_blob_read(rs->blob, dst, len, (int)offset) != SQLITE_OK) {
-        sqlite3_free(dst);
-        sqlite3_result_error(ctx,
-            sqlite3_errmsg(sqlite3_context_db_handle(ctx)), -1);
-      } else {
-        sqlite3_result_blob(ctx, dst, len, sqlite3_free);
-      }
-    }
-  } else {
+  } else if (!rs->zstd) {
+    result_raw_range(ctx, rs, offset, len);
+  } else if (seekable) {
     result_seekable_range(ctx, rs->zs, offset, len);
+  } else {
+    result_frame_range(ctx, rs, offset, len);
   }
 
   if (fresh) sqlite3_set_auxdata(ctx, 0, rs, rowsource_free);
+}
+
+static void fn_seekable_decompress_row(sqlite3_context *ctx, int argc,
+                                       sqlite3_value **argv) {
+  (void)argc;
+  row_range(ctx, argv, 1);
+}
+
+static void fn_frame_decompress_row(sqlite3_context *ctx, int argc,
+                                    sqlite3_value **argv) {
+  (void)argc;
+  row_range(ctx, argv, 0);
 }
 
 /* ---- zstd_content_size(data) ----------------------------------------- */
@@ -597,6 +728,11 @@ SQLITE_ZSTD_API int sqlite3_zstd_init(sqlite3 *db, char **pzErrMsg,
   if (rc != SQLITE_OK) return rc;
   rc = sqlite3_create_function(db, "zstd_seekable_decompress", 5, SQLITE_UTF8,
                                0, fn_seekable_decompress_row, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+
+  /* A range of a row holding one frame, read in place from its first byte */
+  rc = sqlite3_create_function(db, "zstd_frame_decompress", 5, SQLITE_UTF8,
+                               0, fn_frame_decompress_row, 0, 0);
   if (rc != SQLITE_OK) return rc;
 
   /* Content size */
